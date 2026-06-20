@@ -1,0 +1,8 @@
+name: quick-ack
+version: 1.0.0
+description: "Instant acknowledgment before deep thinking — sends a quick reply to users while the main model processes the full response."
+author: "MrLing1202"
+license: "GPL-3.0"
+homepage: "https://github.com/MrLing1202/hermes-quick-ack"
+provides_hooks:
+  - pre_gateway_dispatch
