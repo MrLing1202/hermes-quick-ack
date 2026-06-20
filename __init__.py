@@ -1,15 +1,13 @@
 """
-Quick-Ack Plugin for Hermes Agent
-==================================
+Quick-Ack Plugin v2 — 智能秒回，不是机器人废话
+=================================================
 
-Sends an instant acknowledgment to the user when a message arrives,
-before the main model starts processing. Two modes:
+用户发消息后，先用快模型回一句"像人说的话"，再用主模型深度回答。
 
-- **static**: Sends a fixed customizable message (zero latency)
-- **smart**:  Calls a fast LLM to generate a contextual one-liner
-
-The full response follows normally — the ack just tells the user
-"Hermes heard you and is thinking."
+三个模式：
+- static  : 固定话术（最简单）
+- smart   : 快模型根据上下文生成一句话（自然、有理解力）
+- preview : 快模型直接给出简短回答预览，主模型随后给出完整版
 
 Config (config.yaml)::
 
@@ -17,54 +15,80 @@ Config (config.yaml)::
       entries:
         quick-ack:
           enabled: true
-          mode: smart                    # 'static' or 'smart'
-          ack_message: "收到，正在思考中..."  # used in static mode
-          model:                          # used in smart mode
+          mode: smart
+          model:
             provider: google
             model: gemini-2.0-flash
-          max_length: 60                  # max chars for smart ack
-          skip_patterns:                  # skip ack for these patterns
+          max_length: 80
+          skip_patterns:
             - "^/"
-            - "^\\\\s*$"
+            - "^\\s*$"
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Default ack messages for static mode (rotated randomly for variety)
-_FALLBACK_ACKS = [
-    "收到，正在思考中…",
-    "马上来，稍等一下～",
-    "已收到，处理中 ⏳",
-    "好的，让我想想…",
-]
+# ---------------------------------------------------------------------------
+# System prompts — 这是灵魂，决定了 ack 是"像人话"还是"像机器人"
+# ---------------------------------------------------------------------------
 
-# System prompt for smart ack generation
-_SMART_ACK_SYSTEM = (
-    "You are a quick-responder bot. Given a user's message, generate a very short "
-    "acknowledgment (under 30 characters in the same language as the user's message). "
-    "Be natural, friendly, and varied. Don't repeat the user's words. "
-    "Just acknowledge you received it and are working on it. "
-    "Examples: '好的，让我看看', '收到，马上处理', 'Let me think about that...', "
-    "'好的！这个有意思', 'Looking into it ⏳'. "
-    "Reply with ONLY the acknowledgment, nothing else."
-)
+_SMART_SYSTEM = """你是一个对话助手的"快速响应层"。用户刚发来一条消息，主模型正在深度思考中。
 
-# Patterns to skip (commands, empty messages, etc.)
-_DEFAULT_SKIP_PATTERNS = [
-    r"^/",           # slash commands
-    r"^\s*$",        # empty/whitespace
-]
+你的任务：回一句话，让对方知道你"听懂了"，而且正在认真对待。
+
+要求：
+1. 用和用户相同的语言回复
+2. 像朋友聊天一样自然，不要客套、不要"收到"、不要"稍等"
+3. 要体现你理解了对方的问题/需求，可以简单复述或回应关键词
+4. 可以带一点个人风格（好奇、兴奋、认真），但不要浮夸
+5. 20-50个字，不要超过一行
+6. 绝对不要说"正在思考"、"处理中"、"稍等"这类话
+
+好的例子：
+- 用户："帮我写个爬虫" → "爬虫啊，抓哪个网站的数据？我先想想方案"
+- 用户："这段代码报错了" → "报错了？让我看看什么情况"
+- 用户："写一篇关于AI的文章" → "AI的文章，有字数要求吗？我先构思一下"
+- 用户："解释一下量子计算" → "量子计算！这个话题有意思"
+- 用户："debug this function" → "Let me take a close look at this function"
+- 用户："帮我翻译成英文" → "好的，翻成英文，我来好好处理"
+- 用户："今天天气怎么样" → "查天气是吧"
+
+坏的例子：
+- "收到，正在为您处理" ✗
+- "好的，稍等一下" ✗
+- "我来帮您解决这个问题" ✗
+- "感谢您的提问" ✗
+
+直接回复，不要加引号，不要加任何前缀。"""
+
+_PREVIEW_SYSTEM = """你是一个对话助手的"快速预览层"。用户刚发来一条消息，主模型还在深度思考中。
+
+你的任务：用1-2句话快速给出一个简短但有用的回答预览。不是确认收到，而是直接回答。
+
+要求：
+1. 用和用户相同的语言回复
+2. 直接回答，不要说"让我想想"之类的话
+3. 给出核心要点或方向，细节留给后面的完整回答
+4. 30-80个字
+5. 如果是代码问题，可以先指出可能的原因
+6. 如果是知识问题，可以先给一句话结论
+
+好的例子：
+- 用户："Python怎么读取Excel" → "用pandas库，一行代码搞定：pd.read_excel('文件.xlsx')，详细用法我马上给你展开"
+- 用户："解释一下REST API" → "简单说就是用HTTP动词（GET/POST/PUT/DELETE）操作资源的接口规范，我来给你详细讲讲"
+- 用户："这段代码为什么慢" → "大概率是循环里反复查数据库了，批量查询会快很多。我来看看具体代码"
+
+直接回复，不要加引号，不要加任何前缀。"""
 
 
 def _load_config() -> Dict[str, Any]:
-    """Load plugin config from config.yaml."""
     try:
         from hermes_cli.config import cfg_get
         return cfg_get("plugins.entries.quick-ack", {}) or {}
@@ -72,159 +96,98 @@ def _load_config() -> Dict[str, Any]:
         return {}
 
 
-def _should_skip(text: str, skip_patterns: list[str]) -> bool:
-    """Check if message should skip the ack."""
-    for pattern in skip_patterns:
+def _should_skip(text: str, patterns: List[str]) -> bool:
+    for p in patterns:
         try:
-            if re.search(pattern, text):
+            if re.search(p, text):
                 return True
         except re.error:
             continue
     return False
 
 
-async def _send_ack_via_gateway(
-    gateway: Any,
-    event: Any,
-    message: str,
-) -> None:
-    """Send ack message through the platform adapter."""
+async def _send_ack(gateway: Any, event: Any, message: str) -> None:
     try:
-        source = event.source
-        platform = source.platform
-        chat_id = str(source.chat_id)
-
-        adapter = gateway.adapters.get(platform)
-        if not adapter:
-            logger.debug("quick-ack: no adapter for platform %s", platform)
-            return
-
-        await adapter.send(chat_id, message)
-        logger.debug("quick-ack: sent ack to %s/%s", platform.value, chat_id)
+        src = event.source
+        adapter = gateway.adapters.get(src.platform)
+        if adapter:
+            await adapter.send(str(src.chat_id), message)
+            logger.debug("quick-ack: sent to %s/%s", src.platform.value, src.chat_id)
     except Exception as exc:
-        logger.warning("quick-ack: failed to send ack: %s", exc)
+        logger.warning("quick-ack: send failed: %s", exc)
 
 
-async def _generate_smart_ack(
+async def _generate_ack(
     ctx: Any,
     user_text: str,
-    model_config: Dict[str, Any],
-    max_length: int,
+    model_cfg: Dict[str, Any],
+    max_len: int,
+    mode: str,
 ) -> Optional[str]:
-    """Call a fast LLM to generate a contextual ack."""
+    system = _PREVIEW_SYSTEM if mode == "preview" else _SMART_SYSTEM
     try:
-        provider = model_config.get("provider")
-        model = model_config.get("model")
-
-        messages = [
-            {"role": "system", "content": _SMART_ACK_SYSTEM},
-            {"role": "user", "content": user_text[:500]},  # truncate for speed
-        ]
-
         result = await ctx.llm.acomplete(
-            messages=messages,
-            provider=provider,
-            model=model,
-            max_tokens=60,
-            temperature=0.8,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_text[:800]},
+            ],
+            provider=model_cfg.get("provider"),
+            model=model_cfg.get("model"),
+            max_tokens=120 if mode == "preview" else 60,
+            temperature=0.9,
         )
-
         if result and result.text:
-            ack = result.text.strip().strip('"').strip("'")
-            # Enforce max length
-            if len(ack) > max_length:
-                ack = ack[:max_length] + "…"
+            ack = result.text.strip().strip('"').strip("'").strip("「」""")
+            if len(ack) > max_len:
+                ack = ack[:max_len] + "…"
             return ack if ack else None
-
     except Exception as exc:
-        logger.warning("quick-ack: smart ack generation failed: %s", exc)
-
+        logger.warning("quick-ack: LLM call failed: %s", exc)
     return None
 
 
 def _on_pre_gateway_dispatch(
-    *,
-    event: Any,
-    gateway: Any,
-    session_store: Any,
-    **kwargs: Any,
+    *, event: Any, gateway: Any, session_store: Any, **kw: Any,
 ) -> Dict[str, str]:
-    """Hook: fires before agent dispatch on every incoming message.
-
-    Sends a quick ack asynchronously, then returns allow to continue
-    normal processing.
-    """
-    config = _load_config()
-
-    if not config.get("enabled", True):
+    cfg = _load_config()
+    if not cfg.get("enabled", True):
         return {"action": "allow"}
 
-    user_text = (event.text or "").strip()
-    skip_patterns = config.get("skip_patterns", _DEFAULT_SKIP_PATTERNS)
-
-    if _should_skip(user_text, skip_patterns):
+    text = (event.text or "").strip()
+    if _should_skip(text, cfg.get("skip_patterns", [r"^/", r"^\s*$"])):
         return {"action": "allow"}
 
-    mode = config.get("mode", "smart")
-    max_length = config.get("max_length", 60)
+    mode = cfg.get("mode", "smart")
+    max_len = cfg.get("max_length", 80)
+    model_cfg = cfg.get("model", {})
+
+    ctx = getattr(_on_pre_gateway_dispatch, "_ctx", None)
 
     if mode == "static":
-        ack_message = config.get("ack_message", _FALLBACK_ACKS[0])
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_send_ack_via_gateway(gateway, event, ack_message))
-        except RuntimeError:
-            logger.debug("quick-ack: no event loop, skipping static ack")
-
-    elif mode == "smart":
-        model_config = config.get("model", {})
-        if not model_config.get("model"):
-            # Fallback to static if no model configured
-            ack_message = config.get("ack_message", _FALLBACK_ACKS[0])
+        msg = cfg.get("ack_message", "")
+        if msg:
             try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(_send_ack_via_gateway(gateway, event, ack_message))
+                asyncio.get_running_loop().create_task(_send_ack(gateway, event, msg))
             except RuntimeError:
                 pass
-        else:
-            # We need ctx for LLM access, but it's not in hook kwargs.
-            # Use a closure captured during register().
-            if hasattr(_on_pre_gateway_dispatch, "_ctx"):
-                ctx = _on_pre_gateway_dispatch._ctx
-                try:
-                    loop = asyncio.get_running_loop()
 
-                    async def _smart_ack():
-                        ack = await _generate_smart_ack(
-                            ctx, user_text, model_config, max_length
-                        )
-                        if ack:
-                            await _send_ack_via_gateway(gateway, event, ack)
-                        else:
-                            # Fallback to static on LLM failure
-                            fallback = config.get("ack_message", _FALLBACK_ACKS[0])
-                            await _send_ack_via_gateway(gateway, event, fallback)
+    elif ctx and model_cfg.get("model"):
+        try:
+            loop = asyncio.get_running_loop()
 
-                    loop.create_task(_smart_ack())
-                except RuntimeError:
-                    logger.debug("quick-ack: no event loop, skipping smart ack")
-            else:
-                # No ctx available, fallback to static
-                ack_message = config.get("ack_message", _FALLBACK_ACKS[0])
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(_send_ack_via_gateway(gateway, event, ack_message))
-                except RuntimeError:
-                    pass
+            async def _do():
+                ack = await _generate_ack(ctx, text, model_cfg, max_len, mode)
+                if ack:
+                    await _send_ack(gateway, event, ack)
+
+            loop.create_task(_do())
+        except RuntimeError:
+            pass
 
     return {"action": "allow"}
 
 
 def register(ctx: Any) -> None:
-    """Plugin entry point — register the pre_gateway_dispatch hook."""
-    # Store ctx on the callback so the hook can access LLM
     _on_pre_gateway_dispatch._ctx = ctx
-
     ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
-
-    logger.info("quick-ack: plugin registered (pre_gateway_dispatch hook)")
+    logger.info("quick-ack v2 registered")
